@@ -27,9 +27,20 @@ class DJIHelper():
 		self.recv_endpoint = 0x85
 		self.reload_filter_data()
 #		self.responsequeue = queue.Queue()
-
+		self.dumptype = 0
 		self.register_dissector(75, self.dissect_accel_data)
+		self.register_dissector(152, self.dissect_perf_data)
 
+
+
+	def dump(self,dumpdata):
+		print(self.dump_formatd(dumpdata))
+
+	def dump_format(self, dumpdata):
+		if self.dumptype == 0:
+			return ' '.join(format(x, '02x') for x in dumpdata)
+		elif  self.dumptype == 1:
+			return dumpdata
 
 	def register_dissector(self,pkttype, dissectorfunc):
 		self.dissector[pkttype] = dissectorfunc
@@ -37,7 +48,16 @@ class DJIHelper():
 	def dissect_accel_data(self, pkt):
 		labels= ["GIMBLE_X","GIMBLE_Y","GIMBLE_Z","GIMBLEUNK","UNK02","UNK03","UNK04","UNK05","UNK06","UNK07","UNK08","UNK09","UNK10","UNK11","UNK12","UNK13",]
 		vals = struct.unpack(">3h3i11h",pkt[9:-9])
-		return json.dumps(dict(zip(labels,vals)), indent=4, sort_keys=True)
+		ret = dict(zip(labels,vals))
+		print(json.dumps(ret, indent=4, sort_keys=True))
+		return ret
+
+
+	def dissect_perf_data(self, pkt):
+		perfdata = {"GPS_SATS":pkt[45]}
+		print("perf (152):", self.dump_format(pkt))
+		print(json.dumps(perfdata, indent=4, sort_keys=True))
+		return perfdata
 
 	def register_dji_response(self, pkt):
 		extra = {}
@@ -239,11 +259,13 @@ class DJIShell(cmd.Cmd):
 		pkt += bytes(str(argval), encoding='utf8') #wm260_1502_v10.21.40.13_20220321.pro.fw.sig
 		pkt += b"\x00\x00\x01\x01"
 		self.device_write(pkt)
-
+	
+		time.sleep(.5)
 		pkt = b"\x0D\x04\x33\x2A\x03\x11\x0D\x40\x00\x0E"
+		self.device_write(pkt)
 
 
-	def do_request_file2(self, arg):
+	def do_request_file_enc(self, arg):
 		if not self.connected:
 			print("not connected to device")
 			return
