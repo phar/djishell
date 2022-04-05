@@ -7,7 +7,9 @@ import threading, queue
 from threading import Event
 import os
 import readline
-
+import time
+import logging
+import serial
 
 
 PKT_CLASS_DJI = 0x55
@@ -16,7 +18,7 @@ PKT_CLASS_TRANSFER = 0x21
 
 
 class DJIHelper():
-	def __init__(self):
+	def __init__(self, logfile="dji_log.log"):
 		self.vid = 0x2ca3
 		self.pid = 0x0022
 		self.events = {}
@@ -25,16 +27,155 @@ class DJIHelper():
 		self.pkt_types = {}
 		self.send_endpoint = 0x04
 		self.recv_endpoint = 0x85
+
+		self.logger = logging.getLogger('djishell')
+		
+		self.logger.setLevel(logging.DEBUG)
+
+		self.ser = None
+		self.serpath = None
+		self.serrbaud = None
+		self.logfile = logfile
+
+		self.c_handler = logging.StreamHandler()
+		self.f_handler = logging.FileHandler(self.logfile)
+		self.c_handler.setLevel(logging.INFO)
+		self.f_handler.setLevel(logging.DEBUG)
+
+		# Create formatters and add it to handlers
+		c_format = logging.Formatter('%(levelname)s - %(message)s')
+		f_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+		self.c_handler.setFormatter(c_format)
+		self.f_handler.setFormatter(f_format)
+
+		# Add handlers to the logger
+		self.logger.addHandler(self.c_handler)
+		self.logger.addHandler(self.f_handler)
+
+		self.connected = False
+		self.device_read = None
+		self.device_write = None
 		self.reload_filter_data()
-#		self.responsequeue = queue.Queue()
 		self.dumptype = 0
-		self.register_dissector(75, self.dissect_accel_data)
-		self.register_dissector(152, self.dissect_perf_data)
+		
+
+		
+
+	def set_debug_level(self, level):
+		self.c_handler.setLevel(level)
+	
+	
+	def connect_uart(self, uart_path="/dev/tty.usbmodem3QDSJ2T0040QRL5", baudrate=115200):
+		try:
+			self.serpath = uart_path
+			self.serrbaud = 115200 #this doesnt matter for dji devices but feels weird without a baud
+			self.ser = serial.Serial(port=self.serpath,baudrate=self.serrbaud)
+			self.connected = True
+			self.device_read = self.uart_read_packet
+			self.device_write = self.uart_write_packet
+			self.listenthread = threading.Thread(target=self.listener_thread, args=(1,))
+			self.listenthread.start()
+			self.logger.info("connected")
+		except serial.serialutil.SerialException:
+			self.logger.info("unable to connect to device")
 
 
+	def uart_write_packet(self, pkt):
+		if self.connected:
+			buf = self.prepare_to_send(pkt)
+			self.ser.write(buf)
+		
+	def uart_read_packet(self):
+		buffer = []
+		crcok = False
+		pa = ord(self.ser.read())
+		while pa != 0x55:
+			pa = ser.read()
+		buffer.append(pa)
+
+		blen = ord(self.ser.read()) #fixme, this is probably not right for 0x21 packets.. but im not sure they exist on uart streams?
+		buffer.append(blen)
+		for i in range(blen - 2): #minus the bytes already read
+			buffer.append(ord(self.ser.read()))
+		buffer = bytes(buffer)
+		return (buffer)
+
+	
+	def connect_usb(self, vid=0x2ca3,pid=0x0022):
+		if self.connected == False:
+			self.vid = vid
+			self.pid = pid
+			self.usbdev = usb.core.find(idVendor=self.vid, idProduct=self.pid)
+			if self.usbdev is None:
+				self.logger.info("unable to connect to device")
+				return
+			usb.util.claim_interface(self.usbdev, 1)
+			self.cfg = self.usbdev.get_active_configuration()
+			self.connected = True
+			self.device_read = self.usb_read_packet
+			self.device_write = self.usb_write_packet
+			self.listenthread = threading.Thread(target=self.listener_thread, args=(1,))
+			self.listenthread.start()
+			self.logger.info("connected.")
+		else:
+			self.logger.info("already connected, disconnect first")
+
+
+	def listener_thread(self,arg):
+		while(self.connected):
+				pkt = self.device_read()
+				if pkt != None:
+					(handled, trimmedresponse,extra) = self.register_dji_response(pkt)
+					
+					if not handled:
+						if self.dumptype == 0:
+							dd = ' '.join(format(x, '02x') for x in trimmedresponse)
+						elif  self.dumptype == 1:
+							dd = str(trimmedresponse)
+
+						if(str(int(trimmedresponse[1])) in  self.pkt_types):
+							self.logger.debug(self.pkt_types[str(int(trimmedresponse[1]))],int(trimmedresponse[1])+ "\t"+dd)
+						else:
+							self.logger.debug("UNKNOWN_TYPE "+str(trimmedresponse[1])+ "\t"+dd)
+				else:
+					self.logger.error("failed to read from device")
+				
+				
+	def usb_write_packet(self,buffer):
+		if self.connected:
+			buf = self.prepare_to_send(buffer)
+			try:
+				self.usbdev.write(self.send_endpoint,buf)
+				self.logger.debug("sent: " + str(buf))
+				return True
+			except usb.core.USBError:
+				self.logger.error("device disconnected:")
+				self.device_read = None
+				self.device_write = None
+				self.connected = False
+		else:
+			self.logger.error("not connected: ")
+		return False
+
+
+	def usb_read_packet(self):
+		if self.connected:
+			try:
+				pkt = bytes(self.usbdev.read(self.recv_endpoint,4096))
+				self.logger.debug("read: " + str(pkt))
+				return pkt
+			except usb.core.USBError:
+				self.logger.error("device disconnected:")
+				self.device_read = None
+				self.device_write = None
+				self.connected = False
+				return None
+		else:
+			self.logger.error("not connected: ")
+		return None
 
 	def dump(self,dumpdata):
-		print(self.dump_formatd(dumpdata))
+		self.logger.info(self.dump_formatd(dumpdata))
 
 	def dump_format(self, dumpdata):
 		if self.dumptype == 0:
@@ -49,14 +190,14 @@ class DJIHelper():
 		labels= ["GIMBLE_X","GIMBLE_Y","GIMBLE_Z","GIMBLEUNK","UNK02","UNK03","UNK04","UNK05","UNK06","UNK07","UNK08","UNK09","UNK10","UNK11","UNK12","UNK13",]
 		vals = struct.unpack(">3h3i11h",pkt[9:-9])
 		ret = dict(zip(labels,vals))
-		print(json.dumps(ret, indent=4, sort_keys=True))
+		self.logger.info("(75) " + json.dumps(ret, indent=4, sort_keys=True))
 		return ret
 
 
 	def dissect_perf_data(self, pkt):
 		perfdata = {"GPS_SATS":pkt[45]}
-		print("perf (152):", self.dump_format(pkt))
-		print(json.dumps(perfdata, indent=4, sort_keys=True))
+		self.logger.info("perf (152): " + self.dump_format(pkt))
+		self.logger.info(json.dumps(perfdata, indent=4, sort_keys=True))
 		return perfdata
 
 	def register_dji_response(self, pkt):
@@ -81,15 +222,12 @@ class DJIHelper():
 
 				return (ret,pkt,extra)
 		elif pkt[0] == PKT_CLASS_TRANSFER:
-			print("File Transfer Class (%d)" %  pkt[0], ' '.join(format(x, '02x') for x in pkt))
-
+			self.logger.info("File Transfer Class (%d)" %  pkt[0], ' '.join(format(x, '02x') for x in pkt))
 			ret = True
 		else:
-			print("non-handled packet class (%d)" %  pkt[0], ' '.join(format(x, '02x') for x in pkt))
+			self.logger.info("non-handled packet class (%d)" %  pkt[0], ' '.join(format(x, '02x') for x in pkt))
 			ret = True
 		return (ret,pkt,extra)
-
-#	def subscribe_event(self,event_name):
 
 	def wait_event(self, pkttype, timeout=5):
 		if pkttype not in self.events:
@@ -102,28 +240,28 @@ class DJIHelper():
 		self.load_filter()
 
 	def load_filter(self):
-#		try:
+		try:
 			f = open('pkt_filter.json')
 			try:
 				self.pkt_filter = json.load(f)
 			except json.decoder.JSONDecodeError:
-				print("bad pkt_filter.json file")
+				self.logger.warning("bad pkt_filter.json file")
 				self.pkt_filter = []
 			f.close()
-#		except:
-#			self.pkt_filter = {}
+		except:
+			self.logger.warning("cant open pkt_filter.json file")
 				
 	def load_types(self):
-#		try:
+		try:
 			f = open('pkt_types.json')
 			try:
 				self.pkt_types = json.load(f)
 			except json.decoder.JSONDecodeError:
-				print("bad pkt_types.json file")
+				self.logger.warning("bad pkt_types.json file")
 				self.pkt_types =  {}
 			f.close()
-#		except:
-#			self.pkt_types = {}
+		except:
+			self.logger.warning("cant open pkt_types.json file")
 
 	def validate_packet(self,pkt):
 		v = struct.unpack("<H",pkt[-2:])[0]
@@ -188,6 +326,8 @@ class DJIHelper():
 
 
 
+
+
 histfile = os.path.expanduser('dji_cmd_history')
 histfile_size = 1000
 
@@ -200,14 +340,18 @@ class DJIShell(cmd.Cmd):
 	testval = 1
 	dumptype = 0
 
+	dji.register_dissector(75, dji.dissect_accel_data)
+	dji.register_dissector(152, dji.dissect_perf_data)
+
+
 	def do_dumptype(self,arg):
 		self.dumptype = int(arg)
-	
-	def precmd(self, line):
-		line = line.lower()
-		if self.file and 'playback' not in line:
-			print(line, file=self.file)
-		return line
+#
+#	def precmd(self, line):
+##		line = line.lower()
+#		if self.file and 'playback' not in line:
+#			print(line, file=self.file)
+#		return line
 		
 	def close(self):
 		if self.file:
@@ -220,32 +364,31 @@ class DJIShell(cmd.Cmd):
 
 	def do_connect_uart(self,arg):
 		"""connect to uart device"""
-		#this is a note for a fixme because the controller does expose this protocol on a CDC UART interface
-		#and this tool might help in probing that protocol as well
+		print(arg)
+		self.dji.connect_uart(arg)
 
 	def do_connect_usb(self,arg):
 		"""connect to raw usb device"""
-		if self.connected == False:
-			self.usbdev = usb.core.find(idVendor=self.dji.vid, idProduct=self.dji.pid)
-			if self.usbdev is None:
-				print("unable to connect to device")
-				return
-			usb.util.claim_interface(self.usbdev, 1)
-			self.cfg = self.usbdev.get_active_configuration()
-			self.connected = True
-			
-			self.listenthread = threading.Thread(target=self.client_thread, args=(1,))
-			self.listenthread.start()
-		print("connected.")
+		self.dji.connect_usb()
+#		if self.connected == False:
+#			self.usbdev = usb.core.find(idVendor=self.dji.vid, idProduct=self.dji.pid)
+#			if self.usbdev is None:
+#				print("unable to connect to device")
+#				return
+#			usb.util.claim_interface(self.usbdev, 1)
+#			self.cfg = self.usbdev.get_active_configuration()
+#			self.connected = True
+#
+#			self.listenthread = threading.Thread(target=self.client_thread, args=(1,))
+#			self.listenthread.start()
+#		print("connected.")
 		
 	def do_send(self,arg):
 		if not self.connected:
 			print("not connected to device")
 			return
 		try:
-			buf = self.dji.prepare_to_send(bytes.fromhex(arg))
-			print("sent:",buf)
-			self.usbdev.write(self.dji.send_endpoint,buf)
+			self.dji.device_write(bytes.fromhex(arg))
 		except ValueError:
 			print("bad input packet")
 
@@ -258,11 +401,11 @@ class DJIShell(cmd.Cmd):
 		pkt += bytes([len(argval.strip())])
 		pkt += bytes(str(argval), encoding='utf8') #wm260_1502_v10.21.40.13_20220321.pro.fw.sig
 		pkt += b"\x00\x00\x01\x01"
-		self.device_write(pkt)
+		self.dji.device_write(pkt)
 	
 		time.sleep(.5)
 		pkt = b"\x0D\x04\x33\x2A\x03\x11\x0D\x40\x00\x0E"
-		self.device_write(pkt)
+		self.dji.device_write(pkt)
 
 
 	def do_request_file_enc(self, arg):
@@ -274,41 +417,35 @@ class DJIShell(cmd.Cmd):
 		pkt += bytes([len(arg.strip())])
 		pkt += bytes(str(arg), encoding='utf8') #[or(x) for x in list(arg.strip())]
 		pkt += b"\x09\x01\x04"
-		self.device_write(pkt)
+		self.dji.device_write(pkt)
 		
 		pkt = b"\x04\x6D\x0A\x1D\xEB\x1A\x80\x00\x2A\x00\xD0\x03\xD0\x07\x01\x01"
-		self.device_write(pkt)
+		self.dji.device_write(pkt)
 
 		
 	def do_get_device_serial(self,arg):
 		pkt = b"\x04\x33\x2A\x03\xEF\x69\x40\x00\x01"
-		self.device_write(pkt)
+		self.dji.device_write(pkt)
 
 	def do_get_device_version(self,arg):
 		pkt = b"\x04\x33\x2A\x1f\xEF\x69\x40\x00\x01"
-		self.device_write(pkt)
+		self.dji.device_write(pkt)
 
 	def do_get_device_data(self,arg):
 		for i in range(0xff):
 			pkt = b"\x04\x33\x2A"
 			pkt += bytes([i])
 			pkt += b"\xEF\x69\x40\x00\x01"
-			self.device_write(pkt)
+			self.dji.device_write(pkt)
 
 
-#		04 33 2A 1F EE 69 40 00 01
-#		04 33 2A 03 EF 69 40 00 01
-
-
-	def device_write(self,buffer):
-		buf = self.dji.prepare_to_send(buffer)
-		print("sent:",buf)
-		self.usbdev.write(self.dji.send_endpoint,buf)
-
-	def device_write_raw(self,buffer):
-		print("sent:",buffer)
-		self.usbdev.write(self.dji.send_endpoint,buffer)
-
+	def do_add_filter(self, arg):
+		try:
+			self.dji.pkt_filter.append(int(arg))
+			print("added filter for type", int(arg))
+		except:
+			pass
+			
 	def do_request_file(self, arg):
 		if not self.connected:
 			print("not connected to device")
@@ -320,74 +457,12 @@ class DJIShell(cmd.Cmd):
 		pkt += b"\x09\x01\x00"
 #		print(pkt)
 #		try:
-		buf = self.dji.prepare_to_send(pkt)
-		print("sent:",buf)
-		self.usbdev.write(self.dji.send_endpoint,buf)
+		self.dji.device_write(pkt)
 #		except ValueError:
 #			print("bad input packet")
 
 	
 			
-	def client_thread(self,arg):
-		while(1):
-			try:
-				pkt = bytes(self.usbdev.read(self.dji.recv_endpoint,1024))
-				(handled, trimmedresponse,extra) = self.dji.register_dji_response(pkt)
-				
-				if not handled:
-					if self.dumptype == 0:
-						dd = ' '.join(format(x, '02x') for x in trimmedresponse)
-					elif  self.dumptype == 1:
-						dd = trimmedresponse
 
-					if(str(int(trimmedresponse[1])) in  self.dji.pkt_types):
-						print(self.dji.pkt_types[str(int(trimmedresponse[1]))],int(trimmedresponse[1]), "\t",dd)
-					else:
-						print("UNKNOWN_TYPE",int(trimmedresponse[1]), "\t",dd)
-
-
-			except usb.core.USBError:
-				print("USB IO Error")
-				time.sleep(1)
-				self.connected = False
-				
-
-	def preloop(self):
-		if readline and os.path.exists(histfile):
-			readline.read_history_file(histfile)
-
-	def postloop(self):
-		if readline:
-			readline.set_history_length(histfile_size)
-			readline.write_history_file(histfile)
-
-
-
-def parse(arg):
-	a = list(arg)
-	l = []
-	t = ""
-	inquote = 0
-	for i in a:
-		if i in ["\"","'"]:
-			inquote ^= 1
-			if len(t):
-				l.append(t.strip())
-				t = ""
-			
-		else:
-			if i == " " and inquote == 0:
-				if len(t):
-					l.append(t.strip())
-					t = ""
-				
-			else:
-				t += i
-				
-				
-	if len(t):
-		l.append(t.strip())
-	return l
-			
 if __name__ == '__main__':
     DJIShell().cmdloop()
